@@ -1,7 +1,8 @@
 import { type NextRequest, NextResponse } from "next/server";
 
 export function proxy(request: NextRequest) {
-  if (request.nextUrl.pathname.startsWith("/ping")) {
+  const pathname = request.nextUrl.pathname;
+  if (pathname === "/ping" || pathname === "/ping/") {
     return new Response("pong", { status: 200 });
   }
 

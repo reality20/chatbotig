@@ -48,6 +48,7 @@ type StoredChat = {
   botId: string;
   messages: StoredMessage[];
   updatedAt: string;
+  gradioHistory?: unknown[];
 };
 
 type ToolCall = {
@@ -173,7 +174,7 @@ const MCP_SERVERS: McpServer[] = [
 
 function loadGradioClient() {
   const importFromCdn = new Function(
-    'return import("https://cdn.jsdelivr.net/npm/@gradio/client/+esm")'
+    'return import("https://cdn.jsdelivr.net/npm/@gradio/client@1.7.0/+esm")'
   ) as () => Promise<GradioClientModule>;
   return importFromCdn();
 }
@@ -268,25 +269,36 @@ async function callMcpTool(toolCall: ToolCall) {
     },
   };
 
-  const response = await fetch(server.url, {
-    method: "POST",
-    headers: {
-      Accept: "application/json, text/event-stream",
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000);
 
-  if (!response.ok) {
-    throw new Error(`${server.name} returned ${response.status}`);
+  try {
+    const response = await fetch(server.url, {
+      method: "POST",
+      headers: {
+        Accept: "application/json, text/event-stream",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      throw new Error(`${server.name} returned ${response.status}`);
+    }
+
+    return {
+      serverId: server.id,
+      server: server.name,
+      tool: toolCall.tool,
+      result: await readMcpResponse(response),
+    };
+  } catch (error) {
+    clearTimeout(timeoutId);
+    throw error;
   }
-
-  return {
-    serverId: server.id,
-    server: server.name,
-    tool: toolCall.tool,
-    result: await readMcpResponse(response),
-  };
 }
 
 function ServerAnimation({
@@ -369,7 +381,7 @@ function ServerAnimation({
   );
 }
 
-export function XylariaMcpChat() {
+export function XylariaMcpChat({ initialChatId }: { initialChatId?: string } = {}) {
   const [chats, setChats] = useState<StoredChat[]>([]);
   const [activeChatId, setActiveChatId] = useState<string>("");
   const [selectedBotId, setSelectedBotId] = useState(CHATBOTS[0].id);
@@ -379,22 +391,33 @@ export function XylariaMcpChat() {
   const [status, setStatus] = useState("Ready");
   const [activeServerId, setActiveServerId] = useState<string | null>(null);
   const [isRunning, setIsRunning] = useState(false);
-  const gradioHistoryRef = useRef<unknown[]>([]);
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    const stored = window.localStorage.getItem(STORAGE_KEY);
-    const currentId = window.localStorage.getItem(CURRENT_CHAT_KEY);
-    const parsed = stored ? (JSON.parse(stored) as StoredChat[]) : [];
-    const seeded = parsed.length ? parsed : [createEmptyChat()];
-    setChats(seeded);
-    setActiveChatId(
-      currentId && seeded.some((chat) => chat.id === currentId)
-        ? currentId
-        : seeded[0].id
-    );
-    setSelectedBotId(seeded[0].botId);
-  }, []);
+    try {
+      const stored = window.localStorage.getItem(STORAGE_KEY);
+      const currentId = window.localStorage.getItem(CURRENT_CHAT_KEY);
+      const parsed = stored ? (JSON.parse(stored) as StoredChat[]) : [];
+      const seeded = Array.isArray(parsed) && parsed.length ? parsed : [createEmptyChat()];
+      setChats(seeded);
+
+      let targetId = seeded[0].id;
+      if (initialChatId && seeded.some((chat) => chat.id === initialChatId)) {
+        targetId = initialChatId;
+      } else if (currentId && seeded.some((chat) => chat.id === currentId)) {
+        targetId = currentId;
+      }
+
+      setActiveChatId(targetId);
+      const targetChat = seeded.find((chat) => chat.id === targetId) ?? seeded[0];
+      setSelectedBotId(targetChat.botId);
+    } catch {
+      const seeded = [createEmptyChat()];
+      setChats(seeded);
+      setActiveChatId(seeded[0].id);
+      setSelectedBotId(seeded[0].botId);
+    }
+  }, [initialChatId]);
 
   useEffect(() => {
     if (chats.length) {
@@ -408,6 +431,9 @@ export function XylariaMcpChat() {
       const active = chats.find((chat) => chat.id === activeChatId);
       if (active) {
         setSelectedBotId(active.botId);
+        if (!active.gradioHistory) {
+          updateActiveChat((chat) => ({ ...chat, gradioHistory: [] }));
+        }
       }
     }
   }, [activeChatId, chats]);
@@ -435,7 +461,11 @@ export function XylariaMcpChat() {
     CHATBOTS.find((bot) => bot.id === selectedBotId) ?? CHATBOTS[0];
 
   const syncGradioHistory = (history: unknown[]) => {
-    gradioHistoryRef.current = history;
+    updateActiveChat((chat) => ({ ...chat, gradioHistory: history }));
+  };
+
+  const getGradioHistory = (): unknown[] => {
+    return activeChat?.gradioHistory ?? [];
   };
 
   const updateActiveChat = (updater: (chat: StoredChat) => StoredChat) => {
@@ -463,11 +493,10 @@ export function XylariaMcpChat() {
   };
 
   const startNewChat = (botId = selectedBotId) => {
-    const chat = createEmptyChat(botId);
+    const chat = { ...createEmptyChat(botId), gradioHistory: [] };
     setChats((current) => [chat, ...current]);
     setActiveChatId(chat.id);
     setSelectedBotId(botId);
-    syncGradioHistory([]);
     setPrompt("Hello!!");
   };
 
@@ -488,7 +517,7 @@ export function XylariaMcpChat() {
     text: string
   ) => {
     const add = await client.predict("/add_text", {
-      history: gradioHistoryRef.current,
+      history: getGradioHistory(),
       text,
     });
     const nextHistory = (add.data[0] as unknown[]) ?? [];
@@ -511,7 +540,7 @@ export function XylariaMcpChat() {
     }
     setStatus("Uploading media to Qwen...");
     const upload = await client.predict("/add_file", {
-      history: gradioHistoryRef.current,
+      history: getGradioHistory(),
       file: handleFile(file),
     });
     syncGradioHistory((upload.data[0] as unknown[]) ?? []);
